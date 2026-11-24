@@ -1,0 +1,23 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // החשבונות החדשים: כל משתמשת יכולה לקרוא ולכתוב רק את המסמך של עצמה
+    match /accounts/{uid} {
+      allow read, write: if request.auth != null && request.auth.uid == uid;
+    }
+
+    // זמני! מסמכי הגרסה הישנה – פתוחים לקריאה ולמחיקה רק כדי לאפשר העברה אוטומטית בכניסה הבאה.
+    // אחרי שכל המשתמשים התחברו פעם אחת (האוסף "users" ריק בקונסול) – החליפי את שתי השורות ל:
+    //   allow read, write: if false;
+    match /users/{username} {
+      allow read, delete: if true;
+      allow create, update: if false;
+    }
+
+    // כל השאר חסום
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

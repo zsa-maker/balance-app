@@ -1,6 +1,9 @@
 import { initializeApp } from 'firebase/app';
 import { getFirestore } from 'firebase/firestore';
+import { getAuth, initializeAuth, indexedDBLocalPersistence } from 'firebase/auth';
+import { Capacitor } from '@capacitor/core';
 
+// מפתחות ה-Web של Firebase אינם סוד – האבטחה האמיתית היא ב-firestore.rules + Firebase Auth
 const firebaseConfig = {
   apiKey: "AIzaSyCK1cLnKbfptUX-6qYmJflaXKaYwKmpDBI",
   authDomain: "my-balance-app-4f5ef.firebaseapp.com",
@@ -13,3 +16,8 @@ const firebaseConfig = {
 
 const app = initializeApp(firebaseConfig);
 export const db = getFirestore(app);
+
+// בתוך אפליקציית אנדרואיד (Capacitor) getAuth רגיל עלול להיתקע – לכן initializeAuth עם IndexedDB
+export const auth = Capacitor.isNativePlatform()
+  ? initializeAuth(app, { persistence: indexedDBLocalPersistence })
+  : getAuth(app);

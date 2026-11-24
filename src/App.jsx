@@ -990,17 +990,33 @@ export default function App() {
       alert('אין עדיין אירועים ביומן לייצוא.');
       return;
     }
-    let ics = "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//BalanceApp//HE\n";
+    if (isNative) {
+      alert('באפליקציית האנדרואיד אין צורך בייצוא – התזכורות מגיעות ישירות כהתראות, והאירוע הקרוב מוצג בווידג׳ט 🌿');
+      return;
+    }
+    const esc = (t = '') => String(t).replace(/\\/g, '\\\\').replace(/;/g, '\\;').replace(/,/g, '\\,').replace(/\n/g, '\\n');
+    const nextDay = (dStr) => addIntervalToDate(dStr, 1, 'daily').replace(/-/g, '');
+    const stamp = new Date().toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z';
+    const lines = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//BalanceApp//HE', 'CALSCALE:GREGORIAN'];
     evList.forEach(ev => {
       const d = ev.date.replace(/-/g, '');
       const t = (ev.time || '12:00').replace(':', '') + '00';
-      ics += "BEGIN:VEVENT\n";
-      ics += `SUMMARY:${ev.typeIcon || '📅'} ${ev.title}\n`;
-      ics += ev.isAllDay ? `DTSTART;VALUE=DATE:${d}\n` : `DTSTART:${d}T${t}\n`;
-      ics += `DESCRIPTION:${ev.notes || ''}\n`;
-      ics += "END:VEVENT\n";
+      lines.push('BEGIN:VEVENT');
+      lines.push(`UID:${ev.id}@balance-app`);
+      lines.push(`DTSTAMP:${stamp}`);
+      lines.push(`SUMMARY:${esc(`${ev.typeIcon || '📅'} ${ev.title}`)}`);
+      if (ev.isAllDay) {
+        lines.push(`DTSTART;VALUE=DATE:${d}`);
+        lines.push(`DTEND;VALUE=DATE:${nextDay(ev.date)}`);
+      } else {
+        lines.push(`DTSTART:${d}T${t}`);
+        lines.push('DURATION:PT1H');
+      }
+      if (ev.notes) lines.push(`DESCRIPTION:${esc(ev.notes)}`);
+      lines.push('END:VEVENT');
     });
-    ics += "END:VCALENDAR";
+    lines.push('END:VCALENDAR');
+    const ics = lines.join('\r\n');
 
     const blob = new Blob([ics], { type: 'text/calendar;charset=utf-8' });
     const url = URL.createObjectURL(blob);
@@ -1008,6 +1024,7 @@ export default function App() {
     a.href = url;
     a.download = `my-calendar-events.ics`;
     a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
   };
 
   const saveCalendarEvent = () => {
@@ -2397,7 +2414,7 @@ export default function App() {
               <label>סיסמה אישית</label>
               <input 
                 type="password"
-                placeholder="לפחות 4 תווים..."
+                placeholder={authMode === "register" ? "לפחות 6 תווים..." : "הסיסמה שלך..."}
                 value={authPassword}
                 onChange={e => setAuthPassword(e.target.value)}
                 autoComplete={authMode === 'login' ? 'current-password' : 'new-password'}

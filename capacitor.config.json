@@ -1,0 +1,14 @@
+{
+  "appId": "com.balance.journal",
+  "appName": "איזון יומי",
+  "webDir": "dist",
+  "android": {
+    "allowMixedContent": false
+  },
+  "plugins": {
+    "LocalNotifications": {
+      "smallIcon": "ic_stat_notify",
+      "iconColor": "#f4b342"
+    }
+  }
+}
