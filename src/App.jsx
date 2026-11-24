@@ -9,6 +9,8 @@ import { Capacitor } from '@capacitor/core';
 import { db, auth } from './firebase';
 import { notify, isNative, buildSchedulePlan, syncNativeSchedule, clearNativeSchedule, scheduleOneShot, cancelOneShot, NOTIF_IDS, initNativeNotifications } from './lib/notifications';
 import { updateNativeWidget, listenForDeepLinks } from './lib/native';
+import { haptic, showToast, subscribeToasts, getStoredTheme, applyTheme, THEME_KEY } from './lib/ui';
+import { exportBackup, readBackupFile } from './lib/backup';
 import { 
   Sun, Moon, CheckSquare, Flame, Wallet, Utensils, 
   Bell, Plus, BookOpen, Footprints, Droplets, Calendar as CalendarIcon, 
@@ -433,6 +435,17 @@ const loadUserDaysHistory = (usernameKey) => {
   return {};
 };
 
+function ToastHost({ toasts }) {
+  if (!toasts.length) return null;
+  return (
+    <div className="toast-host" role="status" aria-live="polite">
+      {toasts.map(t => (
+        <div key={t.id} className={`toast toast-${t.kind}`}>{t.message}</div>
+      ))}
+    </div>
+  );
+}
+
 export default function App() {
   const realTodayStr = getLocalDateStr();
   const [selectedDate, setSelectedDate] = useState(realTodayStr);
@@ -629,6 +642,25 @@ export default function App() {
   const [tempScore, setTempScore] = useState(8);
   const [tempSummary, setTempSummary] = useState('');
 
+  // --- ערכת נושא (בהיר / כהה / אוטומטי) והודעות צפות ---
+  const [themePref, setThemePref] = useState(getStoredTheme);
+  const [toasts, setToasts] = useState([]);
+
+  useEffect(() => {
+    applyTheme(themePref);
+    try { localStorage.setItem(THEME_KEY, themePref); } catch (e) {}
+    if (themePref !== 'auto' || !window.matchMedia) return;
+    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    const onChange = () => applyTheme('auto');
+    mq.addEventListener?.('change', onChange);
+    return () => mq.removeEventListener?.('change', onChange);
+  }, [themePref]);
+
+  useEffect(() => subscribeToasts(toast => {
+    setToasts(prev => [...prev.filter(t => t.kind !== toast.kind || toast.kind !== 'points'), toast].slice(-3));
+    setTimeout(() => setToasts(prev => prev.filter(t => t.id !== toast.id)), toast.duration);
+  }), []);
+
   // --- רגע קשה עם אוכל (SOS) ---
   const [showUrgeModal, setShowUrgeModal] = useState(false);
   const [urgeStep, setUrgeStep] = useState('halt'); // halt | timer | outcome | done
@@ -806,6 +838,43 @@ export default function App() {
       else setAuthError('משהו השתבש בהתחברות. נסי שוב.');
     } finally {
       setAuthLoading(false);
+    }
+  };
+
+  const [backupBusy, setBackupBusy] = useState(false);
+
+  const handleExportBackup = async () => {
+    setBackupBusy(true);
+    try {
+      const name = await exportBackup({ username: currentUser?.username, globalData, daysHistory });
+      showToast(`הגיבוי נשמר: ${name} 💾`, { kind: 'success' });
+    } catch (e) {
+      if (!String(e?.message || '').toLowerCase().includes('cancel')) {
+        showToast('לא הצלחתי ליצור גיבוי. נסי שוב.', { kind: 'warning' });
+      }
+    } finally {
+      setBackupBusy(false);
+    }
+  };
+
+  const handleImportBackup = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    try {
+      const data = await readBackupFile(file);
+      const when = data.exportedAt ? new Date(data.exportedAt).toLocaleDateString('he-IL') : 'לא ידוע';
+      if (!window.confirm(`לשחזר את הגיבוי מתאריך ${when}?\nהנתונים הנוכחיים יוחלפו בנתוני הגיבוי.`)) return;
+      // גיבוי בטיחות אוטומטי של המצב הנוכחי במכשיר לפני ההחלפה
+      try {
+        localStorage.setItem(`balance_user_${currentUser.username}_pre_restore`, JSON.stringify({ globalData, daysHistory, at: new Date().toISOString() }));
+      } catch (err) {}
+      setGlobalData(ensureGlobalDataFields(data.globalData, realTodayStr));
+      setDaysHistory(data.daysHistory || {});
+      showToast('הגיבוי שוחזר בהצלחה ✓', { kind: 'success' });
+      haptic('success');
+    } catch (err) {
+      showToast(err.message || 'השחזור נכשל', { kind: 'warning', duration: 3500 });
     }
   };
 
@@ -987,11 +1056,11 @@ export default function App() {
   const exportAllEventsToICS = () => {
     const evList = globalData.events || [];
     if (evList.length === 0) {
-      alert('אין עדיין אירועים ביומן לייצוא.');
+      showToast('אין עדיין אירועים ביומן לייצוא.', { kind: 'warning' });
       return;
     }
     if (isNative) {
-      alert('באפליקציית האנדרואיד אין צורך בייצוא – התזכורות מגיעות ישירות כהתראות, והאירוע הקרוב מוצג בווידג׳ט 🌿');
+      showToast('באנדרואיד אין צורך בייצוא – התזכורות מגיעות כהתראות והאירוע הקרוב מוצג בווידג׳ט 🌿', { duration: 4000 });
       return;
     }
     const esc = (t = '') => String(t).replace(/\\/g, '\\\\').replace(/;/g, '\\;').replace(/,/g, '\\,').replace(/\n/g, '\\n');
@@ -1477,7 +1546,11 @@ export default function App() {
       lifetimePoints: delta > 0 ? (prev.lifetimePoints || prev.points) + delta : (prev.lifetimePoints || prev.points)
     }));
     if (delta > 0) {
-      confetti({ particleCount: 35, spread: 60, origin: { y: 0.8 } });
+      confetti({ particleCount: 35, spread: 60, origin: { y: 0.8 }, disableForReducedMotion: true });
+      haptic('success');
+      showToast(`+${delta} נק׳ ⭐`, { kind: 'points', duration: 1400 });
+    } else if (delta < 0) {
+      haptic('light');
     }
   };
 
@@ -2242,6 +2315,63 @@ export default function App() {
   const topDayPart = Object.entries(dayPartCounts).sort((a, b) => b[1] - a[1])[0];
   const urgesWithTimer = last7Urges.filter(u => u.usedTimer);
   const surfedCount = urgesWithTimer.filter(u => u.outcome === 'passed' || u.outcome === 'meal').length;
+  // --- תובנות שבועיות (7 הימים האחרונים, מהישן לחדש) ---
+  const MOOD_VALUES = { '🤩': 5, '🙂': 4, '😐': 3, '😤': 2, '😴': 2 };
+  const weekInsights = [...last7Dates].reverse().map(dStr => {
+    const day = daysHistory[dStr] || {};
+    const moods = [
+      ...(day.journals || []).map(j => MOOD_VALUES[j.mood]),
+      day.middayCheckin ? MOOD_VALUES[day.middayCheckin.mood] : undefined
+    ].filter(Boolean);
+    const habitsTotal = (globalData.habits || []).length;
+    const habitsDone = (globalData.habits || []).filter(h => (h.completedDates || []).includes(dStr)).length;
+    const [, , dd] = dStr.split('-');
+    const [y, m, d] = dStr.split('-').map(Number);
+    return {
+      dateStr: dStr,
+      label: HEBREW_DAYS[new Date(y, m - 1, d).getDay()],
+      dayNum: Number(dd),
+      score: day.dailyScore ?? null,
+      mood: moods.length ? moods.reduce((a, b) => a + b, 0) / moods.length : null,
+      water: day.waterCount || 0,
+      sleep: day.sleepHours ?? null,
+      habitsPct: habitsTotal ? Math.round((habitsDone / habitsTotal) * 100) : null,
+      journals: (day.journals || []).length,
+      isToday: dStr === realTodayStr
+    };
+  });
+  const avgOf = arr => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null);
+  const scoredDays = weekInsights.filter(d => d.score !== null);
+  const weekAvgScore = avgOf(scoredDays.map(d => Number(d.score)));
+  const weekAvgWater = avgOf(weekInsights.map(d => d.water));
+  const weekHabitsPct = avgOf(weekInsights.filter(d => d.habitsPct !== null).map(d => d.habitsPct));
+  const weekJournalCount = weekInsights.reduce((a, d) => a + d.journals, 0);
+  const weekInsightTips = (() => {
+    const tips = [];
+    const compare = (pred, label) => {
+      const yes = scoredDays.filter(pred).map(d => Number(d.score));
+      const no = scoredDays.filter(d => !pred(d)).map(d => Number(d.score));
+      if (yes.length >= 2 && no.length >= 2) {
+        const diff = avgOf(yes) - avgOf(no);
+        if (Math.abs(diff) >= 0.8) {
+          tips.push(diff > 0
+            ? `בימים ש${label}, הציון היומי שלך היה גבוה ב-${diff.toFixed(1)} בממוצע ✨`
+            : `מעניין: בימים ש${label} הציון דווקא היה נמוך יותר – אולי משהו אחר משפיע? 🤔`);
+        }
+      }
+    };
+    compare(d => d.water >= globalData.waterTarget, 'עמדת ביעד המים');
+    compare(d => d.sleep !== null && d.sleep >= 7, 'ישנת 7 שעות ומעלה');
+    compare(d => d.habitsPct !== null && d.habitsPct >= 50, 'השלמת לפחות חצי מההרגלים');
+    compare(d => d.journals > 0, 'כתבת ביומן');
+    if (!tips.length) {
+      tips.push(scoredDays.length < 4
+        ? 'דרגי עוד כמה ימים בערב – ואז אראה לך מה הכי משפיע על ההרגשה שלך 🌱'
+        : 'השבוע די יציב – המשיכי בקצב שלך 🌿');
+    }
+    return tips.slice(0, 2);
+  })();
+
   const selectedDayUrges = currentDay.urges || [];
   const eatingSupport = globalData.eatingSupport || DEFAULT_EATING_SUPPORT;
   const urgeSecondsLeft = urgeTimerEnd ? Math.max(0, Math.ceil((urgeTimerEnd - urgeTick) / 1000)) : 0;
@@ -2310,7 +2440,8 @@ export default function App() {
   // --- חנות פינוקים ---
   const redeemReward = (reward) => {
     if (globalData.points < reward.cost) {
-      alert(`חסרות לך עוד ${reward.cost - globalData.points} נקודות כדי לממש את הפינוק הזה!`);
+      showToast(`חסרות לך עוד ${reward.cost - globalData.points} נקודות לפינוק הזה – את בדרך! 🌱`, { kind: 'warning' });
+      haptic('warning');
       return;
     }
     setGlobalData(prev => ({
@@ -2321,7 +2452,9 @@ export default function App() {
         ...(prev.redeemedHistory || [])
       ]
     }));
-    confetti({ particleCount: 75, spread: 85, origin: { y: 0.6 } });
+    confetti({ particleCount: 75, spread: 85, origin: { y: 0.6 }, disableForReducedMotion: true });
+    haptic('success');
+    showToast(`מימשת: ${reward.title} – מגיע לך! 🎁`, { kind: 'success', duration: 3200 });
   };
 
   const addCustomReward = () => {
@@ -2363,7 +2496,7 @@ export default function App() {
         <div style={{ textAlign: 'center', marginBottom: '20px' }}>
           <div style={{ fontSize: '2.4rem', marginBottom: '4px' }}>🌿</div>
           <h1 style={{ fontSize: '1.65rem', fontWeight: 900 }}>איזון יומי ויומן</h1>
-          <p style={{ fontSize: '0.88rem', color: '#78716c', marginTop: '4px' }}>
+          <p style={{ fontSize: '0.88rem', color: 'var(--muted)', marginTop: '4px' }}>
             התחברי לחשבון האישי שלך כדי לסנכרן נתונים בין כל המכשירים
           </p>
         </div>
@@ -2447,10 +2580,11 @@ export default function App() {
   if (widgetMode) {
     return (
       <div className="widget-mode-shell">
+        <ToastHost toasts={toasts} />
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <div>
             <h3 style={{ margin: 0 }}>יומן ואיזון 🌿 ({currentUser.displayName})</h3>
-            <small style={{ color: '#78716c' }}>{realTodayStr} • ⭐ {globalData.points} נק׳ • ציון {computedBalanceScore}</small>
+            <small style={{ color: 'var(--muted)' }}>{realTodayStr} • ⭐ {globalData.points} נק׳ • ציון {computedBalanceScore}</small>
           </div>
           <button onClick={exitWidgetModeWithUrl} style={{ fontSize: '0.8rem', padding: '8px 14px' }}>
             לאפליקציה המלאה ↗
@@ -2471,7 +2605,7 @@ export default function App() {
           </div>
 
           {upcomingEvents.length === 0 ? (
-            <p style={{ fontSize: '0.82rem', color: '#78716c' }}>אין אירועים קרובים ביומן.</p>
+            <p style={{ fontSize: '0.82rem', color: 'var(--muted)' }}>אין אירועים קרובים ביומן.</p>
           ) : (
             upcomingEvents.slice(0, 5).map(ev => (
               <div key={ev.id} className="upcoming-widget-item" style={{ borderRightColor: ev.color || '#f4b342' }}>
@@ -2479,7 +2613,7 @@ export default function App() {
                   <div style={{ fontWeight: 800, fontSize: '0.9rem' }}>
                     {ev.typeIcon || '📅'} {ev.title}
                   </div>
-                  <small style={{ color: '#78716c', display: 'block' }}>
+                  <small style={{ color: 'var(--muted)', display: 'block' }}>
                     {ev.typeLabel || 'אירוע'} {ev.notes ? `• ${ev.notes}` : ''}
                   </small>
                 </div>
@@ -2497,7 +2631,7 @@ export default function App() {
               <div key={h.id} className={`widget-habit-chip ${isDone ? 'done' : ''}`} onClick={() => toggleHabitOnSelectedDate(h.id)}>
                 <div>
                   <span>{isDone ? '✓ ' : '○ '} {h.time ? `[${h.time}] ` : ''}{h.title}</span>
-                  {h.subtitle && <div style={{ fontSize: '0.74rem', color: '#78716c' }}>{h.subtitle}</div>}
+                  {h.subtitle && <div style={{ fontSize: '0.74rem', color: 'var(--muted)' }}>{h.subtitle}</div>}
                 </div>
                 <span style={{ fontSize: '0.8rem', fontWeight: 700 }}>🔥 {calculateStreak(h.completedDates || [])}</span>
               </div>
@@ -2510,6 +2644,7 @@ export default function App() {
 
   return (
     <div className="app-shell">
+      <ToastHost toasts={toasts} />
       {/* Toolbar עליון אסתטי */}
       <header className="clean-toolbar">
         <div className="toolbar-top">
@@ -2536,7 +2671,7 @@ export default function App() {
             </div>
             <button 
               className="circle-icon-btn" 
-              style={{ background: '#fef5df', borderColor: '#f4b342' }}
+              style={{ background: 'var(--amber-soft)', borderColor: '#f4b342' }}
               onClick={() => setShowNotificationCenter(true)} 
               title="תזכורות והתראות"
             >
@@ -2569,14 +2704,14 @@ export default function App() {
         </div>
       </header>
 
-      <main className="content">
+      <main className="content tab-fade" key={activeTab}>
         {/* טאב 1: מסך הבית + סדר יום */}
         {activeTab === 'day' && (
           <>
             <div className="section-header" style={{ marginTop: 2 }}>
               <span className="section-title">צ׳ק-אין יומי</span>
               <small 
-                style={{ color: '#78716c', cursor: 'pointer', fontWeight: 700 }}
+                style={{ color: 'var(--muted)', cursor: 'pointer', fontWeight: 700 }}
                 onClick={() => setMantraIdx((mantraIdx + 1) % MANTRAS.length)}
               >
                 החלף מנטרה ↻
@@ -2589,7 +2724,7 @@ export default function App() {
                 "{MANTRAS[mantraIdx]}"
               </div>
 
-              <svg viewBox="0 0 360 110" style={{ width: '100%', height: '90px', display: 'block', marginTop: '6px' }}>
+              <svg viewBox="0 0 360 110" preserveAspectRatio="xMidYMax meet" style={{ width: 'calc(100% + 36px)', height: 'auto', display: 'block', margin: '6px -18px 0' }}>
                 <circle cx="275" cy="48" r="24" fill="#f97316" />
                 <circle cx="268" cy="44" r="2.2" fill="#1c1917" />
                 <circle cx="282" cy="44" r="2.2" fill="#1c1917" />
@@ -2599,8 +2734,8 @@ export default function App() {
                 <line x1="245" y1="26" x2="239" y2="21" stroke="#f97316" strokeWidth="3" strokeLinecap="round" />
                 <line x1="312" y1="50" x2="319" y2="50" stroke="#f97316" strokeWidth="3" strokeLinecap="round" />
                 <line x1="238" y1="50" x2="231" y2="50" stroke="#f97316" strokeWidth="3" strokeLinecap="round" />
-                <path d="M-10 110 Q90 65 210 92 T370 75 L370 115 L-10 115 Z" fill="#a3be8c" />
-                <path d="M120 110 Q240 68 370 95 L370 115 L120 115 Z" fill="#84a35a" />
+                <path d="M-20 110 Q90 65 210 92 T380 75 L380 120 L-20 120 Z" fill="#a3be8c" />
+                <path d="M120 110 Q240 68 380 95 L380 120 L120 120 Z" fill="#84a35a" />
                 <polygon points="35,98 46,62 57,98" fill="#3f6212" />
                 <polygon points="60,102 68,75 76,102" fill="#3f6212" />
                 <polygon points="325,95 334,64 343,95" fill="#3f6212" />
@@ -2629,12 +2764,12 @@ export default function App() {
               >
                 <div>
                   <div style={{ fontWeight: 900, fontSize: '0.92rem' }}>עצירה והשתקפות 🌱</div>
-                  <div style={{ fontSize: '0.78rem', color: '#57534e', marginTop: '4px' }}>
+                  <div style={{ fontSize: '0.78rem', color: 'var(--text-2)', marginTop: '4px' }}>
                     על מה את מודה היום?
                   </div>
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '12px' }}>
-                  <small style={{ color: '#78716c', fontSize: '0.72rem' }}>היום</small>
+                  <small style={{ color: 'var(--muted)', fontSize: '0.72rem' }}>היום</small>
                   <span className="pastel-tag">אישי</span>
                 </div>
               </div>
@@ -2648,12 +2783,12 @@ export default function App() {
               >
                 <div>
                   <div style={{ fontWeight: 900, fontSize: '0.92rem' }}>כוונה יומית 🌞</div>
-                  <div style={{ fontSize: '0.78rem', color: '#57534e', marginTop: '4px' }}>
+                  <div style={{ fontSize: '0.78rem', color: 'var(--text-2)', marginTop: '4px' }}>
                     {currentDay.morningIntention ? `"${currentDay.morningIntention}"` : 'איך את רוצה להרגיש היום?'}
                   </div>
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '12px' }}>
-                  <small style={{ color: '#78716c', fontSize: '0.72rem' }}>היום</small>
+                  <small style={{ color: 'var(--muted)', fontSize: '0.72rem' }}>היום</small>
                   <span className="pastel-tag">מיינדפולנס</span>
                 </div>
               </div>
@@ -2690,7 +2825,7 @@ export default function App() {
                 <div className="card-title"><CheckSquare size={18} /> סדר יום, אירועים והרגלים</div>
 
                 {combinedSchedule.length === 0 && (
-                  <p style={{ fontSize: '0.84rem', color: '#78716c', marginBottom: '10px' }}>
+                  <p style={{ fontSize: '0.84rem', color: 'var(--muted)', marginBottom: '10px' }}>
                     אין פעילויות רשומות ליום זה. בחרי קטגוריה למטה להוספה:
                   </p>
                 )}
@@ -2723,7 +2858,7 @@ export default function App() {
                       <div 
                         key={item.id} 
                         className="task-item" 
-                        style={{ background: '#faf7f2', borderRadius: '14px', padding: '8px 10px', marginBottom: '6px', cursor: 'pointer', border: '1px solid #ede8df' }}
+                        style={{ background: 'var(--surface)', borderRadius: '14px', padding: '8px 10px', marginBottom: '6px', cursor: 'pointer', border: '1px solid var(--border)' }}
                         onClick={() => setActiveTab('journal')}
                         title="לחצי למעבר לדף האוכל"
                       >
@@ -2790,7 +2925,7 @@ export default function App() {
                               {item.subtitle && <div className="item-subtitle">{item.subtitle}</div>}
 
                               {item.workoutSubtype && (
-                                <div className="item-subtitle" style={{ color: '#047857', fontWeight: 700 }}>
+                                <div className="item-subtitle" style={{ color: 'var(--green-text)', fontWeight: 700 }}>
                                   סוג אימון: {item.workoutSubtype}
                                 </div>
                               )}
@@ -2812,7 +2947,7 @@ export default function App() {
                             {itemIsWorkout && item.itemType === 'task' && (
                               <button 
                                 className="mini-btn" 
-                                style={{ background: '#d1fae5', color: '#065f46' }}
+                                style={{ background: 'var(--green-soft)', color: 'var(--green-text)' }}
                                 onClick={() => {
                                   setWorkoutMetricModalTask(item.rawObj);
                                   setModalWorkoutIntensity(item.workoutIntensity || 4);
@@ -2845,9 +2980,9 @@ export default function App() {
                 })}
 
                 {/* טופס הוספה לסדר היום */}
-                <div style={{ marginTop: '16px', paddingTop: '12px', borderTop: '1px solid #ede8df' }}>
+                <div style={{ marginTop: '16px', paddingTop: '12px', borderTop: '1px solid var(--border)' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
-                    <small style={{ fontWeight: 900, color: '#1c1917' }}>
+                    <small style={{ fontWeight: 900, color: 'var(--dark)' }}>
                       ➕ בחרי קטגוריה לסדר היום:
                     </small>
                     <button 
@@ -2860,7 +2995,7 @@ export default function App() {
                   </div>
 
                   {showScheduleCatManager && (
-                    <div className="custom-reminder-box" style={{ marginBottom: '10px', background: '#ffffff' }}>
+                    <div className="custom-reminder-box" style={{ marginBottom: '10px', background: 'var(--card)' }}>
                       <div style={{ fontWeight: 800, fontSize: '0.82rem', marginBottom: '6px' }}>
                         ✏️ עריכת קטגוריות סדר יום או הוספת חדשה:
                       </div>
@@ -2919,11 +3054,11 @@ export default function App() {
                   </div>
 
                   {isSelectedCatWorkout && (
-                    <div className="custom-reminder-box" style={{ marginBottom: '8px', background: '#f0fdf4', borderColor: '#86efac' }}>
-                      <small style={{ fontWeight: 800, color: '#065f46', display: 'block', marginBottom: '4px' }}>
+                    <div className="custom-reminder-box" style={{ marginBottom: '8px', background: 'var(--green-soft)', borderColor: '#86efac' }}>
+                      <small style={{ fontWeight: 800, color: 'var(--green-text)', display: 'block', marginBottom: '4px' }}>
                         💪 תת-קטגוריה (איזה אימון? מעניק +{POINTS.WORKOUT} נק׳!):
                       </small>
-                      <select value={workoutSubtype} onChange={e => setWorkoutSubtype(e.target.value)} style={{ background: 'white', marginBottom: '6px' }}>
+                      <select value={workoutSubtype} onChange={e => setWorkoutSubtype(e.target.value)} style={{ background: 'var(--card)', marginBottom: '6px' }}>
                         {WORKOUT_SUBTYPES.map(sub => <option key={sub} value={sub}>{sub}</option>)}
                       </select>
                       {workoutSubtype === 'אחר (הקלדה ידנית)' && (
@@ -2931,24 +3066,24 @@ export default function App() {
                           placeholder="הקלידי את סוג האימון..." 
                           value={customWorkoutSubtype} 
                           onChange={e => setCustomWorkoutSubtype(e.target.value)}
-                          style={{ background: 'white', marginBottom: '6px' }}
+                          style={{ background: 'var(--card)', marginBottom: '6px' }}
                         />
                       )}
-                      <small style={{ fontWeight: 700, color: '#065f46', display: 'block', marginBottom: '4px' }}>
+                      <small style={{ fontWeight: 700, color: 'var(--green-text)', display: 'block', marginBottom: '4px' }}>
                         📊 מדד אחרי האימון (+{POINTS.WORKOUT_METRIC} נק׳ בונוס במילוי):
                       </small>
                       <input 
                         placeholder="איך הרגשת אחרי? מרחק / משקלים / אנרגיה..." 
                         value={workoutPostMetric} 
                         onChange={e => setWorkoutPostMetric(e.target.value)}
-                        style={{ background: 'white' }}
+                        style={{ background: 'var(--card)' }}
                       />
                     </div>
                   )}
 
                   <div className="input-row" style={{ flexDirection: 'column', marginTop: '6px' }}>
                     <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
-                      <small style={{ color: '#78716c', whiteSpace: 'nowrap' }}>שעה (אופציונלי):</small>
+                      <small style={{ color: 'var(--muted)', whiteSpace: 'nowrap' }}>שעה (אופציונלי):</small>
                       <input type="time" value={newTaskTime} onChange={e => setNewTaskTime(e.target.value)} />
                     </div>
                     <input 
@@ -2970,19 +3105,19 @@ export default function App() {
 
               {/* עמודת צד: צעדים + מים + שינה */}
               <div>
-                <div className="side-goal" style={{ background: currentDay.stepsGoalMet ? '#fef5df' : '#ffffff' }}>
+                <div className="side-goal" style={{ background: currentDay.stepsGoalMet ? 'var(--amber-soft)' : '#ffffff' }}>
                   <Footprints size={22} color="#1c1917" />
                   <div style={{ fontWeight: 900, fontSize: '0.84rem', marginTop: '4px' }}>
                     {globalData.stepsTarget.toLocaleString()} צעדים
                   </div>
-                  <div style={{ fontSize: '0.72rem', color: '#78716c', margin: '4px 0 8px' }}>
+                  <div style={{ fontSize: '0.72rem', color: 'var(--muted)', margin: '4px 0 8px' }}>
                     {currentDay.stepsGoalMet ? `עמדת ביעד! (+${POINTS.STEPS})` : `סמני עמידה (+${POINTS.STEPS} נק׳)`}
                   </div>
                   <button 
                     onClick={toggleStepsGoal}
                     style={{ 
                       width: '100%', fontSize: '0.76rem', padding: '8px 6px',
-                      background: currentDay.stepsGoalMet ? '#1c1917' : '#f4b342',
+                      background: currentDay.stepsGoalMet ? 'var(--ink)' : '#f4b342',
                       color: currentDay.stepsGoalMet ? '#ffffff' : '#1c1917'
                     }}
                   >
@@ -3047,7 +3182,7 @@ export default function App() {
                 <input placeholder="משימה חדשה (עבודה / סידורים / פרויקט)..." value={workTitle} onChange={e => setWorkTitle(e.target.value)} />
                 <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
                   <Clock size={16} color="#78716c" />
-                  <small style={{ whiteSpace: 'nowrap', color: '#78716c' }}>דדליין (אופציונלי):</small>
+                  <small style={{ whiteSpace: 'nowrap', color: 'var(--muted)' }}>דדליין (אופציונלי):</small>
                   <input type="date" value={workDeadline} onChange={e => setWorkDeadline(e.target.value)} />
                   {workDeadline && <button className="mini-btn" onClick={() => setWorkDeadline('')}>ללא דדליין</button>}
                 </div>
@@ -3065,21 +3200,30 @@ export default function App() {
                 onClick={() => setShowScoreInfoModal(true)}
                 style={{ position: 'relative', width: '210px', height: '210px', margin: '0 auto', cursor: 'pointer' }}
               >
-                <svg viewBox="0 0 200 200" style={{ width: '100%', height: '100%' }}>
-                  <circle cx="100" cy="100" r="76" fill="none" stroke="#f9e076" strokeWidth="18" strokeDasharray="95 385" strokeDashoffset="0" strokeLinecap="round" />
-                  <circle cx="100" cy="100" r="76" fill="none" stroke="#a3be8c" strokeWidth="18" strokeDasharray="95 385" strokeDashoffset="-120" strokeLinecap="round" />
-                  <circle cx="100" cy="100" r="76" fill="none" stroke="#f8cce0" strokeWidth="18" strokeDasharray="95 385" strokeDashoffset="-240" strokeLinecap="round" />
-                  <circle cx="100" cy="100" r="76" fill="none" stroke="#bfd7f6" strokeWidth="18" strokeDasharray="95 385" strokeDashoffset="-360" strokeLinecap="round" />
+                <svg viewBox="0 0 200 200" style={{ width: '100%', height: '100%', transform: 'rotate(-90deg)' }}>
+                  {PILLARS_INFO.map((p, i) => {
+                    const SEG = 95;
+                    const CIRC = 2 * Math.PI * 76;
+                    const filled = Math.max(4, (Math.min(10, Number(p.score)) / 10) * SEG);
+                    return (
+                      <g key={p.name}>
+                        <circle cx="100" cy="100" r="76" fill="none" stroke={p.color} strokeOpacity="0.25" strokeWidth="18"
+                          strokeDasharray={`${SEG} ${CIRC}`} strokeDashoffset={-i * 120} strokeLinecap="round" />
+                        <circle className="ring-seg" cx="100" cy="100" r="76" fill="none" stroke={p.color} strokeWidth="18"
+                          strokeDasharray={`${filled} ${CIRC}`} strokeDashoffset={-i * 120} strokeLinecap="round" />
+                      </g>
+                    );
+                  })}
                 </svg>
                 <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}>
-                  <div style={{ fontSize: '2.7rem', fontWeight: 900, letterSpacing: '-1px', color: '#1c1917' }}>
+                  <div style={{ fontSize: '2.7rem', fontWeight: 900, letterSpacing: '-1px', color: 'var(--dark)' }}>
                     {computedBalanceScore}
                   </div>
                   <button 
                     type="button"
                     onClick={(e) => { e.stopPropagation(); setShowScoreInfoModal(true); }}
                     style={{ 
-                      background: '#f2ede4', color: '#1c1917', padding: '4px 10px', 
+                      background: 'var(--chip)', color: 'var(--dark)', padding: '4px 10px', 
                       fontSize: '0.75rem', borderRadius: '99px', marginTop: '4px', gap: '4px' 
                     }}
                   >
@@ -3108,6 +3252,59 @@ export default function App() {
               </div>
             </div>
 
+            {/* תובנות שבועיות */}
+            <div className="card insights-card">
+              <div className="card-title" style={{ justifyContent: 'space-between' }}>
+                <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}><TrendingUp size={18} /> השבוע שלך במבט אחד</span>
+                <small style={{ color: 'var(--muted)', fontWeight: 700 }}>7 ימים אחרונים</small>
+              </div>
+
+              <div className="insight-kpis">
+                <div className="insight-kpi">
+                  <span className="insight-kpi-value">{weekAvgScore !== null ? weekAvgScore.toFixed(1) : '–'}</span>
+                  <span className="insight-kpi-label">ציון יומי ממוצע</span>
+                </div>
+                <div className="insight-kpi">
+                  <span className="insight-kpi-value">{weekHabitsPct !== null ? `${Math.round(weekHabitsPct)}%` : '–'}</span>
+                  <span className="insight-kpi-label">השלמת הרגלים</span>
+                </div>
+                <div className="insight-kpi">
+                  <span className="insight-kpi-value">{weekAvgWater !== null ? weekAvgWater.toFixed(1) : '–'}</span>
+                  <span className="insight-kpi-label">כוסות מים ביום</span>
+                </div>
+                <div className="insight-kpi">
+                  <span className="insight-kpi-value">{weekJournalCount}</span>
+                  <span className="insight-kpi-label">כתיבות ביומן</span>
+                </div>
+              </div>
+
+              <div className="insight-chart" role="img" aria-label="ציון יומי ב-7 הימים האחרונים">
+                {weekInsights.map(d => (
+                  <button
+                    key={d.dateStr}
+                    type="button"
+                    className={`insight-bar-col ${d.dateStr === selectedDate ? 'selected' : ''}`}
+                    onClick={() => handleCalendarDayClick(d.dateStr)}
+                    title={d.score !== null ? `ציון ${d.score}/10` : 'לא דורג'}
+                  >
+                    <span className="insight-bar-value">{d.score ?? ''}</span>
+                    <span className="insight-bar-track">
+                      <span
+                        className={`insight-bar-fill ${d.score === null ? 'empty' : d.score >= 8 ? 'high' : d.score >= 5 ? 'mid' : 'low'}`}
+                        style={{ height: d.score !== null ? `${Math.max(8, d.score * 10)}%` : '8%' }}
+                      />
+                    </span>
+                    <span className="insight-mood">{d.mood === null ? '·' : d.mood >= 4.5 ? '🤩' : d.mood >= 3.5 ? '🙂' : d.mood >= 2.5 ? '😐' : '😤'}</span>
+                    <span className={`insight-bar-label ${d.isToday ? 'today' : ''}`}>{d.isToday ? 'היום' : d.label}</span>
+                  </button>
+                ))}
+              </div>
+
+              {weekInsightTips.map(tip => (
+                <div key={tip} className="insight-tip">{tip}</div>
+              ))}
+            </div>
+
             <div className="card">
               <div className="card-title" style={{ justifyContent: 'space-between' }}>
                 <span>מערכות האיזון שלך (פירוט הצבעים)</span>
@@ -3122,7 +3319,7 @@ export default function App() {
                       </span>
                       {p.name}
                     </span>
-                    <span><strong style={{ fontSize: '1rem' }}>{p.score}</strong> <small style={{ color: '#78716c' }}>מתוך 10</small></span>
+                    <span><strong style={{ fontSize: '1rem' }}>{p.score}</strong> <small style={{ color: 'var(--muted)' }}>מתוך 10</small></span>
                   </div>
                   <div className="progress-bar" style={{ height: '10px' }}>
                     <div className="progress-fill" style={{ width: `${Number(p.score) * 10}%`, background: p.color }} />
@@ -3155,7 +3352,7 @@ export default function App() {
                       <>
                         <div>
                           <div style={{ fontWeight: 800 }}>
-                            {h.time ? <span style={{ color: '#b45309', marginLeft: '6px' }}>{h.time}</span> : null}
+                            {h.time ? <span style={{ color: 'var(--amber-text)', marginLeft: '6px' }}>{h.time}</span> : null}
                             {h.title}
                             <span className="workout-metric-pill" style={{ marginRight: '6px', background: isWorkoutH ? '#d1fae5' : '#fef5df', color: isWorkoutH ? '#065f46' : '#92400e' }}>
                               +{isWorkoutH ? POINTS.WORKOUT : POINTS.HABIT} נק׳
@@ -3166,7 +3363,7 @@ export default function App() {
                         <div className="action-icons">
                           <span className="streak-badge">🔥 {calculateStreak(h.completedDates || [])}</span>
                           <button 
-                            style={{ background: isDone ? '#a3be8c' : '#1c1917', color: isDone ? '#1c1917' : 'white', padding: '6px 12px', fontSize: '0.8rem' }} 
+                            style={{ background: isDone ? '#a3be8c' : 'var(--ink)', color: isDone ? '#1c1917' : 'white', padding: '6px 12px', fontSize: '0.8rem' }} 
                             onClick={() => toggleHabitOnSelectedDate(h.id)}
                           >
                             {isDone ? '✓ בוצע' : 'סמני'}
@@ -3183,7 +3380,7 @@ export default function App() {
                 <input placeholder="שם ההרגל המקדם החדש..." value={newHabit} onChange={e => setNewHabit(e.target.value)} />
                 <input placeholder="משפט פירוט מתחת לכותרת ההרגל (אופציונלי)..." value={newHabitSubtitle} onChange={e => setNewHabitSubtitle(e.target.value)} />
                 <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                  <small style={{ whiteSpace: 'nowrap', color: '#78716c' }}>שעה (אופציונלי):</small>
+                  <small style={{ whiteSpace: 'nowrap', color: 'var(--muted)' }}>שעה (אופציונלי):</small>
                   <input type="time" value={newHabitTime} onChange={e => setNewHabitTime(e.target.value)} />
                 </div>
                 <button onClick={addHabit}>הוסף הרגל מקדם</button>
@@ -3218,11 +3415,11 @@ export default function App() {
                 return (
                   <div key={bh.id} className="bad-habit-row">
                     <div>
-                      <div style={{ fontWeight: 800, fontSize: '0.9rem', color: '#881337' }}>{bh.title}</div>
+                      <div style={{ fontWeight: 800, fontSize: '0.9rem', color: 'var(--rose-text)' }}>{bh.title}</div>
                       <div style={{ display: 'flex', gap: '6px', alignItems: 'center', marginTop: '4px', flexWrap: 'wrap' }}>
                         <span className="clean-streak-badge">🛡️ {cleanStreak} ימים נקיים</span>
                         <small style={{ color: '#e11d48', fontWeight: 700 }}>-{bh.penalty} נק׳</small>
-                        {slipsToday > 0 && <small style={{ color: '#9f1239' }}>(דווח {slipsToday} היום)</small>}
+                        {slipsToday > 0 && <small style={{ color: 'var(--rose-text)' }}>(דווח {slipsToday} היום)</small>}
                       </div>
                     </div>
                     <div className="action-icons">
@@ -3241,7 +3438,7 @@ export default function App() {
               <div className="input-row" style={{ flexDirection: 'column', marginTop: '12px' }}>
                 <input placeholder="הרגל שתרצי להפחית..." value={newBadHabitTitle} onChange={e => setNewBadHabitTitle(e.target.value)} />
                 <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                  <small style={{ whiteSpace: 'nowrap', color: '#78716c' }}>קנס נקודות:</small>
+                  <small style={{ whiteSpace: 'nowrap', color: 'var(--muted)' }}>קנס נקודות:</small>
                   <input type="number" value={newBadHabitPenalty} onChange={e => setNewBadHabitPenalty(e.target.value)} style={{ width: '80px' }} />
                   <button style={{ flex: 1 }} onClick={addBadHabit}>+ הוסף הרגל להפחתה</button>
                 </div>
@@ -3263,8 +3460,8 @@ export default function App() {
                     type="button"
                     className="mini-btn"
                     style={{ 
-                      background: isRangeMode ? '#f4b342' : '#f2ede4', 
-                      color: '#1c1917', 
+                      background: isRangeMode ? '#f4b342' : 'var(--chip)', 
+                      color: isRangeMode ? '#1c1917' : 'var(--dark)', 
                       fontWeight: 900 
                     }}
                     onClick={() => {
@@ -3330,7 +3527,7 @@ export default function App() {
                       {score ? (
                         <span className={`score-pill ${scoreClass}`}>{score}/10</span>
                       ) : dayEvents.length > 0 ? (
-                        <span style={{ fontSize: '0.62rem', fontWeight: 700, color: '#92400e' }}>
+                        <span style={{ fontSize: '0.62rem', fontWeight: 700, color: 'var(--amber-text)' }}>
                           {dayEvents[0].typeIcon || '📅'}{dayEvents.length}
                         </span>
                       ) : null}
@@ -3359,7 +3556,7 @@ export default function App() {
                         <div>
                           <span className="event-time-badge">{ev.isAllDay ? 'כל היום' : ev.time}</span>
                           <strong style={{ fontSize: '0.9rem' }}>{ev.typeIcon || '📅'} {ev.title}</strong>
-                          <small style={{ marginRight: '6px', color: '#78716c' }}>({ev.date.slice(5)})</small>
+                          <small style={{ marginRight: '6px', color: 'var(--muted)' }}>({ev.date.slice(5)})</small>
                         </div>
                         {ev.notes && <div className="item-subtitle">{ev.notes}</div>}
                       </div>
@@ -3373,7 +3570,7 @@ export default function App() {
               )}
 
               {showEventTypesManager && (
-                <div style={{ background: '#ffffff', border: '1px solid #ede8df', padding: '12px', borderRadius: '16px', marginBottom: '14px' }}>
+                <div style={{ background: 'var(--card)', border: '1px solid var(--border)', padding: '12px', borderRadius: '16px', marginBottom: '14px' }}>
                   <div style={{ fontWeight: 800, fontSize: '0.85rem', marginBottom: '8px' }}>
                     ✨ הוספה או עריכה של קטגוריות אירועים ביומן:
                   </div>
@@ -3400,12 +3597,12 @@ export default function App() {
                 </div>
               )}
 
-              <div style={{ background: '#faf7f2', padding: '14px', borderRadius: '18px', border: '1px solid #ede8df' }}>
-                <div style={{ fontWeight: 900, fontSize: '0.92rem', marginBottom: '8px', color: editingEventId ? '#b45309' : '#1c1917' }}>
+              <div style={{ background: 'var(--surface)', padding: '14px', borderRadius: '18px', border: '1px solid var(--border)' }}>
+                <div style={{ fontWeight: 900, fontSize: '0.92rem', marginBottom: '8px', color: editingEventId ? 'var(--amber-text)' : 'var(--dark)' }}>
                   {editingEventId ? '✏️ עריכת אירוע קיים' : `➕ הוספת אירוע ליומן ולסדר היום (+${POINTS.EVENT} נק׳)`}
                 </div>
 
-                <small style={{ fontWeight: 800, color: '#57534e' }}>בחרי קטגוריית אירוע:</small>
+                <small style={{ fontWeight: 800, color: 'var(--text-2)' }}>בחרי קטגוריית אירוע:</small>
                 <div className="event-type-chips">
                   {eventTypesList.map(t => (
                     <button
@@ -3426,13 +3623,13 @@ export default function App() {
                     placeholder="כותרת האירוע (למשל: חופשה / יום הולדת / פגישה)..." 
                     value={eventTitle} 
                     onChange={e => setEventTitle(e.target.value)} 
-                    style={{ background: 'white' }}
+                    style={{ background: 'var(--card)' }}
                   />
                   <input 
                     placeholder="משפט פירוט מתחת לכותרת (יופיע גם בסדר היום)..." 
                     value={eventNotes} 
                     onChange={e => setEventNotes(e.target.value)} 
-                    style={{ background: 'white' }}
+                    style={{ background: 'var(--card)' }}
                   />
 
                   <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.84rem', fontWeight: 700, cursor: 'pointer', margin: '4px 0' }}>
@@ -3448,7 +3645,7 @@ export default function App() {
                   {/* בחירת תאריך התחלה ותאריך סיום (רצף ימים) */}
                   <div style={{ display: 'flex', gap: '8px' }}>
                     <div style={{ flex: 1 }}>
-                      <small style={{ fontSize: '0.72rem', color: '#78716c' }}>מתאריך:</small>
+                      <small style={{ fontSize: '0.72rem', color: 'var(--muted)' }}>מתאריך:</small>
                       <input 
                         type="date" 
                         value={eventDate} 
@@ -3456,18 +3653,18 @@ export default function App() {
                           setEventDate(e.target.value);
                           if (eventEndDate < e.target.value) setEventEndDate(e.target.value);
                         }} 
-                        style={{ background: 'white' }} 
+                        style={{ background: 'var(--card)' }} 
                       />
                     </div>
                     {!editingEventId && (
                       <div style={{ flex: 1 }}>
-                        <small style={{ fontSize: '0.72rem', color: '#78716c' }}>עד תאריך (לרצף ימים):</small>
+                        <small style={{ fontSize: '0.72rem', color: 'var(--muted)' }}>עד תאריך (לרצף ימים):</small>
                         <input 
                           type="date" 
                           value={eventEndDate} 
                           min={eventDate}
                           onChange={e => setEventEndDate(e.target.value)} 
-                          style={{ background: 'white' }} 
+                          style={{ background: 'var(--card)' }} 
                         />
                       </div>
                     )}
@@ -3475,16 +3672,16 @@ export default function App() {
 
                   {!eventIsAllDay && (
                     <div>
-                      <small style={{ fontSize: '0.72rem', color: '#78716c' }}>שעת האירוע:</small>
-                      <input type="time" value={eventTime} onChange={e => setEventTime(e.target.value)} style={{ background: 'white' }} />
+                      <small style={{ fontSize: '0.72rem', color: 'var(--muted)' }}>שעת האירוע:</small>
+                      <input type="time" value={eventTime} onChange={e => setEventTime(e.target.value)} style={{ background: 'var(--card)' }} />
                     </div>
                   )}
 
                   <div>
-                    <small style={{ fontSize: '0.75rem', fontWeight: 800, color: '#57534e', display: 'block', marginBottom: '4px' }}>
+                    <small style={{ fontSize: '0.75rem', fontWeight: 800, color: 'var(--text-2)', display: 'block', marginBottom: '4px' }}>
                       🔔 מתי להציג התראה על האירוע?
                     </small>
-                    <select value={eventReminderMode} onChange={e => setEventReminderMode(e.target.value)} style={{ background: 'white' }}>
+                    <select value={eventReminderMode} onChange={e => setEventReminderMode(e.target.value)} style={{ background: 'var(--card)' }}>
                       {REMINDER_OPTIONS.map(opt => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
                     </select>
                   </div>
@@ -3494,7 +3691,7 @@ export default function App() {
                       <small style={{ fontWeight: 700, display: 'block', marginBottom: '4px' }}>
                         ⏱️ כמה דקות לפני האירוע להקפיץ התראה?
                       </small>
-                      <input type="number" value={customMinutesBefore} onChange={e => setCustomMinutesBefore(e.target.value)} style={{ background: 'white' }} />
+                      <input type="number" value={customMinutesBefore} onChange={e => setCustomMinutesBefore(e.target.value)} style={{ background: 'var(--card)' }} />
                     </div>
                   )}
 
@@ -3504,8 +3701,8 @@ export default function App() {
                         🎯 בחרי תאריך ושעה מדויקים להתראה:
                       </small>
                       <div style={{ display: 'flex', gap: '8px' }}>
-                        <input type="date" value={customReminderDate} onChange={e => setCustomReminderDate(e.target.value)} style={{ background: 'white', flex: 1.2 }} />
-                        <input type="time" value={customReminderTime} onChange={e => setCustomReminderTime(e.target.value)} style={{ background: 'white', flex: 1 }} />
+                        <input type="date" value={customReminderDate} onChange={e => setCustomReminderDate(e.target.value)} style={{ background: 'var(--card)', flex: 1.2 }} />
+                        <input type="time" value={customReminderTime} onChange={e => setCustomReminderTime(e.target.value)} style={{ background: 'var(--card)', flex: 1 }} />
                       </div>
                     </div>
                   )}
@@ -3534,17 +3731,17 @@ export default function App() {
                 <button className="mini-btn" onClick={activateWidgetModeWithUrl}>תצוגת ווידג׳ט 📱</button>
               </div>
               {allSortedEvents.length === 0 ? (
-                <p style={{ fontSize: '0.84rem', color: '#78716c' }}>אין עדיין אירועים שמורים ביומן.</p>
+                <p style={{ fontSize: '0.84rem', color: 'var(--muted)' }}>אין עדיין אירועים שמורים ביומן.</p>
               ) : (
                 allSortedEvents.map(ev => (
                   <div key={ev.id} className="upcoming-widget-item" style={{ borderRightColor: ev.color || '#f4b342' }}>
                     <div onClick={() => setSelectedDate(ev.date)} style={{ cursor: 'pointer', flex: 1 }}>
                       <div style={{ fontWeight: 800, fontSize: '0.9rem' }}>
                         {ev.typeIcon || '📅'} {ev.title}
-                        <small style={{ marginRight: '6px', color: '#78716c' }}>({ev.typeLabel || 'אירוע'})</small>
+                        <small style={{ marginRight: '6px', color: 'var(--muted)' }}>({ev.typeLabel || 'אירוע'})</small>
                       </div>
                       {ev.notes && <div className="item-subtitle">{ev.notes}</div>}
-                      <small style={{ color: '#78716c', display: 'block', marginTop: '2px' }}>
+                      <small style={{ color: 'var(--muted)', display: 'block', marginTop: '2px' }}>
                         {formatReminderBadgeText(ev)}
                       </small>
                     </div>
@@ -3561,14 +3758,14 @@ export default function App() {
             {/* חנות הפרסים והפינוקים המורחבת */}
             <div className="card">
               <div className="card-title"><Gift size={18} color="#f4b342" /> חנות הפרסים והפינוקים שלי (⭐ {globalData.points} נק׳ זמינות)</div>
-              <p style={{ fontSize: '0.8rem', color: '#78716c', marginBottom: '12px' }}>
+              <p style={{ fontSize: '0.8rem', color: 'var(--muted)', marginBottom: '12px' }}>
                 כל פעולה מוסיפה נקודות מדודות (אימון = <strong>+{POINTS.WORKOUT} נק׳</strong>, הרגל = <strong>+{POINTS.HABIT} נק׳</strong>, משימה = <strong>+{POINTS.TASK} נק׳</strong>) כך שכל פרס כאן מרגיש כמו הישג אמיתי:
               </p>
               {(globalData.rewards || []).map(r => (
                 <div key={r.id} className="reward-card">
                   <div style={{ flex: 1 }}>
                     <div style={{ fontWeight: 800, fontSize: '0.9rem' }}>{r.title}</div>
-                    <small style={{ color: '#b45309', fontWeight: 800 }}>עלות: ⭐ {r.cost} נק׳</small>
+                    <small style={{ color: 'var(--amber-text)', fontWeight: 800 }}>עלות: ⭐ {r.cost} נק׳</small>
                   </div>
                   <div className="action-icons">
                     <button 
@@ -3642,19 +3839,19 @@ export default function App() {
                             placeholder="אייקון" 
                             value={customOtherExpCatIcon} 
                             onChange={e => setCustomOtherExpCatIcon(e.target.value)} 
-                            style={{ width: '54px', textAlign: 'center', background: 'white' }}
+                            style={{ width: '54px', textAlign: 'center', background: 'var(--card)' }}
                           />
                           <input 
                             placeholder="שם הקטגוריה (למשל: רכב / טיפוח)..." 
                             value={customOtherExpCatName} 
                             onChange={e => setCustomOtherExpCatName(e.target.value)} 
-                            style={{ background: 'white' }}
+                            style={{ background: 'var(--card)' }}
                           />
                           <input 
                             type="color" 
                             value={customOtherExpCatColor} 
                             onChange={e => setCustomOtherExpCatColor(e.target.value)} 
-                            style={{ width: '44px', height: '38px', padding: '2px', background: 'white' }}
+                            style={{ width: '44px', height: '38px', padding: '2px', background: 'var(--card)' }}
                           />
                         </div>
                       </div>
@@ -3668,8 +3865,8 @@ export default function App() {
                           onClick={() => setExpType(key)}
                           style={{
                             flex: 1, padding: '8px 4px', fontSize: '0.74rem',
-                            background: expType === key ? '#1c1917' : '#f2ede4',
-                            color: expType === key ? 'white' : '#1c1917'
+                            background: expType === key ? 'var(--ink)' : 'var(--chip)',
+                            color: expType === key ? 'white' : 'var(--dark)'
                           }}
                         >
                           {info.label}
@@ -3681,7 +3878,7 @@ export default function App() {
                 </>
               ) : (
                 <>
-                  <div className="card-title" style={{ color: '#065f46', marginBottom: '8px' }}>
+                  <div className="card-title" style={{ color: 'var(--green-text)', marginBottom: '8px' }}>
                     <TrendingUp size={18} color="#10b981" /> הוספת הכנסה (חד-פעמית או חוזרת)
                   </div>
                   <div className="input-row" style={{ flexDirection: 'column', marginTop: 0 }}>
@@ -3699,11 +3896,11 @@ export default function App() {
                         placeholder="הקלידי סוג הכנסה חדש (יישמר אוטומטית)..." 
                         value={customIncCategoryName} 
                         onChange={e => setCustomIncCategoryName(e.target.value)} 
-                        style={{ background: '#ecfdf5', borderColor: '#10b981' }}
+                        style={{ background: 'var(--green-soft)', borderColor: '#10b981' }}
                       />
                     )}
 
-                    <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.84rem', fontWeight: 800, cursor: 'pointer', marginTop: '4px', color: '#065f46' }}>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.84rem', fontWeight: 800, cursor: 'pointer', marginTop: '4px', color: 'var(--green-text)' }}>
                       <input 
                         type="checkbox" 
                         checked={incIsRecurring} 
@@ -3714,7 +3911,7 @@ export default function App() {
                     </label>
 
                     {incIsRecurring && (
-                      <div className="custom-reminder-box" style={{ background: '#ecfdf5', borderColor: '#6ee7b7' }}>
+                      <div className="custom-reminder-box" style={{ background: 'var(--green-soft)', borderColor: '#6ee7b7' }}>
                         <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
                           <div style={{ flex: 1 }}>
                             <small style={{ fontWeight: 800 }}>כמה פעמים תחזור?</small>
@@ -3724,12 +3921,12 @@ export default function App() {
                               max="60" 
                               value={incRepeatCount} 
                               onChange={e => setIncRepeatCount(e.target.value)} 
-                              style={{ background: 'white' }}
+                              style={{ background: 'var(--card)' }}
                             />
                           </div>
                           <div style={{ flex: 1.4 }}>
                             <small style={{ fontWeight: 800 }}>באיזו תדירות?</small>
-                            <select value={incRepeatFreq} onChange={e => setIncRepeatFreq(e.target.value)} style={{ background: 'white' }}>
+                            <select value={incRepeatFreq} onChange={e => setIncRepeatFreq(e.target.value)} style={{ background: 'var(--card)' }}>
                               <option value="monthly">מדי חודש (באותו תאריך)</option>
                               <option value="weekly">מדי שבוע</option>
                             </select>
@@ -3746,7 +3943,7 @@ export default function App() {
               )}
 
               {showCategoryEditor && (
-                <div style={{ background: '#faf7f2', border: '1px solid #ede8df', padding: '12px', borderRadius: '16px', marginTop: '14px' }}>
+                <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', padding: '12px', borderRadius: '16px', marginTop: '14px' }}>
                   <div style={{ fontWeight: 800, fontSize: '0.84rem', marginBottom: '8px' }}>
                     🎨 עריכת קטגוריות ההוצאה שלך (מוצגות בגרפים):
                   </div>
@@ -3790,7 +3987,7 @@ export default function App() {
               </div>
 
               {showBudgetSettings && (
-                <div style={{ background: '#faf7f2', padding: '12px', borderRadius: '16px', marginBottom: '12px', border: '1px solid #ede8df' }}>
+                <div style={{ background: 'var(--surface)', padding: '12px', borderRadius: '16px', marginBottom: '12px', border: '1px solid var(--border)' }}>
                   <div style={{ display: 'flex', gap: '8px' }}>
                     <div style={{ flex: 1 }}>
                       <small style={{ fontWeight: 800 }}>יעד הוצאות שבועי (₪):</small>
@@ -3798,7 +3995,7 @@ export default function App() {
                         type="number" 
                         value={weeklyTarget} 
                         onChange={e => setGlobalData({ ...globalData, weeklyLimit: Number(e.target.value) })} 
-                        style={{ background: 'white' }}
+                        style={{ background: 'var(--card)' }}
                       />
                     </div>
                     <div style={{ flex: 1 }}>
@@ -3807,7 +4004,7 @@ export default function App() {
                         type="number" 
                         value={globalData.monthlyBudget} 
                         onChange={e => setGlobalData({ ...globalData, monthlyBudget: Number(e.target.value) })} 
-                        style={{ background: 'white' }}
+                        style={{ background: 'var(--card)' }}
                       />
                     </div>
                   </div>
@@ -3815,27 +4012,27 @@ export default function App() {
               )}
 
               <div className="analytics-grid" style={{ gridTemplateColumns: 'repeat(3, minmax(0, 1fr))' }}>
-                <div className="kpi-box" style={{ background: '#ecfdf5', borderColor: '#a7f3d0' }}>
-                  <small style={{ color: '#065f46', fontWeight: 800 }}>הכנסות החודש</small>
-                  <div className="kpi-value" style={{ color: '#059669' }}>
+                <div className="kpi-box" style={{ background: 'var(--green-soft)', borderColor: '#a7f3d0' }}>
+                  <small style={{ color: 'var(--green-text)', fontWeight: 800 }}>הכנסות החודש</small>
+                  <div className="kpi-value" style={{ color: 'var(--green-text)' }}>
                     ₪{incomeSelectedMonth.toLocaleString()}
                   </div>
                 </div>
-                <div className="kpi-box" style={{ background: '#fff1f2', borderColor: '#fecdd3' }}>
-                  <small style={{ color: '#9f1239', fontWeight: 800 }}>הוצאות החודש</small>
+                <div className="kpi-box" style={{ background: 'var(--rose-soft)', borderColor: '#fecdd3' }}>
+                  <small style={{ color: 'var(--rose-text)', fontWeight: 800 }}>הוצאות החודש</small>
                   <div className="kpi-value" style={{ color: '#e11d48' }}>
                     ₪{spentSelectedMonth.toLocaleString()}
                   </div>
                 </div>
                 <div className="kpi-box">
-                  <small style={{ color: '#78716c', fontWeight: 800 }}>תזרים נטו</small>
-                  <div className="kpi-value" style={{ color: netCashflowMonth >= 0 ? '#059669' : '#e11d48' }}>
+                  <small style={{ color: 'var(--muted)', fontWeight: 800 }}>תזרים נטו</small>
+                  <div className="kpi-value" style={{ color: netCashflowMonth >= 0 ? 'var(--green-text)' : '#e11d48' }}>
                     {netCashflowMonth >= 0 ? `+₪${netCashflowMonth.toLocaleString()}` : `-₪${Math.abs(netCashflowMonth).toLocaleString()}`}
                   </div>
                 </div>
               </div>
 
-              <div style={{ background: '#faf7f2', padding: '12px', borderRadius: '18px', marginBottom: '12px', border: '1px solid #ede8df' }}>
+              <div style={{ background: 'var(--surface)', padding: '12px', borderRadius: '18px', marginBottom: '12px', border: '1px solid var(--border)' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.86rem', marginBottom: '4px' }}>
                   <span>📅 <strong>הוצאות השבוע</strong> ({weekStartStr.slice(5)} עד {weekEndStr.slice(5)}):</span>
                   <span><strong>₪{spentSelectedWeek.toLocaleString()}</strong> / ₪{weeklyTarget.toLocaleString()}</span>
@@ -3873,12 +4070,12 @@ export default function App() {
               </div>
 
               {(incomeSelectedMonth > 0 || spentSelectedMonth > 0) && (
-                <div style={{ marginTop: '14px', paddingTop: '12px', borderTop: '1px solid #ede8df' }}>
+                <div style={{ marginTop: '14px', paddingTop: '12px', borderTop: '1px solid var(--border)' }}>
                   <div style={{ fontWeight: 800, fontSize: '0.85rem', marginBottom: '6px' }}>
                     📊 יחס הכנסות מול הוצאות החודש:
                   </div>
                   <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.78rem', fontWeight: 800 }}>
-                    <span style={{ color: '#059669' }}>
+                    <span style={{ color: 'var(--green-text)' }}>
                       הכנסות ({Math.round((incomeSelectedMonth / Math.max(1, incomeSelectedMonth + spentSelectedMonth)) * 100)}%)
                     </span>
                     <span style={{ color: '#e11d48' }}>
@@ -3904,7 +4101,7 @@ export default function App() {
 
               {incomeCategoryBreakdown.length > 0 && (
                 <div style={{ marginTop: '12px' }}>
-                  <div style={{ fontWeight: 800, fontSize: '0.84rem', marginBottom: '8px', color: '#065f46' }}>
+                  <div style={{ fontWeight: 800, fontSize: '0.84rem', marginBottom: '8px', color: 'var(--green-text)' }}>
                     💰 פילוח הכנסות החודש לפי קטגוריה:
                   </div>
                   {incomeCategoryBreakdown.map(ic => (
@@ -3925,7 +4122,7 @@ export default function App() {
             <div className="card">
               <div className="card-title"><PieChart size={18} /> גרף התפלגות הוצאות ({selectedMonth})</div>
               {spentSelectedMonth === 0 ? (
-                <p style={{ fontSize: '0.85rem', color: '#78716c' }}>עדיין אין הוצאות בחודש זה.</p>
+                <p style={{ fontSize: '0.85rem', color: 'var(--muted)' }}>עדיין אין הוצאות בחודש זה.</p>
               ) : (
                 <>
                   <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.76rem', gap: '4px', marginBottom: '10px', flexWrap: 'wrap' }}>
@@ -3957,14 +4154,14 @@ export default function App() {
               <div className="card-title">📋 היסטוריית הכנסות והוצאות</div>
               {monthIncomes.length > 0 && (
                 <div style={{ marginBottom: '14px' }}>
-                  <small style={{ fontWeight: 800, color: '#065f46' }}>הכנסות בחודש {selectedMonth}:</small>
+                  <small style={{ fontWeight: 800, color: 'var(--green-text)' }}>הכנסות בחודש {selectedMonth}:</small>
                   {monthIncomes.map(inc => (
                     <div key={inc.id} className="task-item">
                       <div>
-                        <div style={{ fontWeight: 800, fontSize: '0.9rem', color: '#059669' }}>
+                        <div style={{ fontWeight: 800, fontSize: '0.9rem', color: 'var(--green-text)' }}>
                           +₪{inc.amount.toLocaleString()} • {inc.title}
                         </div>
-                        <small style={{ color: '#78716c' }}>
+                        <small style={{ color: 'var(--muted)' }}>
                           {inc.category} • {inc.date}
                           {inc.isRecurring ? ` • 🔄 חוזרת (${inc.repeatIndex}/${inc.repeatTotal})` : ''}
                         </small>
@@ -3977,9 +4174,9 @@ export default function App() {
                 </div>
               )}
 
-              <small style={{ fontWeight: 800, color: '#78716c' }}>הוצאות ביום {selectedDate}:</small>
+              <small style={{ fontWeight: 800, color: 'var(--muted)' }}>הוצאות ביום {selectedDate}:</small>
               {dayExpenses.length === 0 ? (
-                <p style={{ fontSize: '0.82rem', color: '#78716c', marginTop: '4px' }}>אין הוצאות רשומות ביום זה.</p>
+                <p style={{ fontSize: '0.82rem', color: 'var(--muted)', marginTop: '4px' }}>אין הוצאות רשומות ביום זה.</p>
               ) : (
                 dayExpenses.map(e => {
                   const tInfo = EXPENSE_TYPES[e.expenseType || 'need'];
@@ -3987,7 +4184,7 @@ export default function App() {
                     <div key={e.id} className="task-item">
                       <div>
                         <div style={{ fontWeight: 800, fontSize: '0.9rem' }}>{e.title}</div>
-                        <small style={{ color: '#78716c' }}>{e.category} • </small>
+                        <small style={{ color: 'var(--muted)' }}>{e.category} • </small>
                         <span className={`type-pill ${tInfo.className}`}>{tInfo.label}</span>
                       </div>
                       <div className="action-icons">
@@ -4021,7 +4218,7 @@ export default function App() {
                   <div key={w.id} className="task-item">
                     <div>
                       <div style={{ fontWeight: 800 }}>{w.title} (₪{w.cost})</div>
-                      <small style={{ color: '#78716c' }}>נוסף ב-{w.createdAt}</small>
+                      <small style={{ color: 'var(--muted)' }}>נוסף ב-{w.createdAt}</small>
                     </div>
                     <div style={{ display: 'flex', gap: '6px' }}>
                       <button style={{ background: '#a3be8c', color: '#1c1917', fontSize: '0.75rem', padding: '6px 10px' }} onClick={() => skipImpulseItem(w)}>
@@ -4110,7 +4307,7 @@ export default function App() {
             <div className="card" style={{ borderTop: '4px solid #f8cce0' }}>
               <div className="card-title" style={{ justifyContent: 'space-between' }}>
                 <span>🫶 תמיכה ברגעים קשים עם אוכל</span>
-                <button className="mini-btn" style={{ background: '#fde8ec', color: '#881337' }} onClick={openUrgeModal}>SOS</button>
+                <button className="mini-btn" style={{ background: 'var(--rose-soft)', color: 'var(--rose-text)' }} onClick={openUrgeModal}>SOS</button>
               </div>
 
               <div className="support-note">
@@ -4118,9 +4315,9 @@ export default function App() {
               </div>
 
               {/* תיעוד היום הנבחר */}
-              <small style={{ fontWeight: 800, color: '#57534e' }}>רגעים שתועדו ב-{selectedDate}:</small>
+              <small style={{ fontWeight: 800, color: 'var(--text-2)' }}>רגעים שתועדו ב-{selectedDate}:</small>
               {selectedDayUrges.length === 0 ? (
-                <p style={{ fontSize: '0.82rem', color: '#78716c', margin: '4px 0 10px' }}>לא תועדו רגעים קשים ביום זה.</p>
+                <p style={{ fontSize: '0.82rem', color: 'var(--muted)', margin: '4px 0 10px' }}>לא תועדו רגעים קשים ביום זה.</p>
               ) : (
                 selectedDayUrges.map(u => (
                   <div key={u.id} className="task-item">
@@ -4165,7 +4362,7 @@ export default function App() {
               )}
 
               {/* הגדרות התראות */}
-              <div className="custom-reminder-box" style={{ marginTop: '12px', background: '#ffffff' }}>
+              <div className="custom-reminder-box" style={{ marginTop: '12px', background: 'var(--card)' }}>
                 <div style={{ fontWeight: 900, fontSize: '0.84rem', marginBottom: '6px' }}>🔔 התראות תומכות</div>
 
                 <small style={{ fontWeight: 800, display: 'block', marginBottom: '4px' }}>
@@ -4221,10 +4418,10 @@ export default function App() {
                 <button className="icon-btn" onClick={() => setReflectionModal({ contextTitle: 'כתיבה חופשית לעומק' })}>+ כתיבה</button>
               </div>
               {currentDay.journals.map(j => (
-                <div key={j.id} style={{ background: '#faf7f2', padding: '12px', borderRadius: '16px', marginBottom: '10px', border: '1px solid #ede8df' }}>
+                <div key={j.id} style={{ background: 'var(--surface)', padding: '12px', borderRadius: '16px', marginBottom: '10px', border: '1px solid var(--border)' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.85rem', fontWeight: 800 }}>
                     <span>{j.mood} {j.context}</span>
-                    <span style={{ color: '#78716c' }}>{j.time}</span>
+                    <span style={{ color: 'var(--muted)' }}>{j.time}</span>
                   </div>
                   <p style={{ marginTop: '6px', fontSize: '0.92rem', lineHeight: 1.5, whiteSpace: 'pre-wrap' }}>{j.thought}</p>
                 </div>
@@ -4239,7 +4436,7 @@ export default function App() {
         <div className="modal-overlay" onClick={() => setWorkoutMetricModalTask(null)}>
           <div className="modal-box" onClick={e => e.stopPropagation()}>
             <h3 style={{ marginBottom: '6px' }}>💪 מדד אחרי אימון: {workoutMetricModalTask.text}</h3>
-            <p style={{ fontSize: '0.84rem', color: '#57534e', marginBottom: '10px' }}>
+            <p style={{ fontSize: '0.84rem', color: 'var(--text-2)', marginBottom: '10px' }}>
               כל הכבוד על השלמת האימון! איך הגוף והאנרגיה שלך מרגישים עכשיו?
             </p>
 
@@ -4247,7 +4444,7 @@ export default function App() {
             <select 
               value={modalWorkoutFeeling} 
               onChange={e => setModalWorkoutFeeling(e.target.value)}
-              style={{ marginBottom: '10px', background: 'white' }}
+              style={{ marginBottom: '10px', background: 'var(--card)' }}
             >
               {POST_WORKOUT_FEELINGS.map(f => <option key={f} value={f}>{f}</option>)}
             </select>
@@ -4261,8 +4458,8 @@ export default function App() {
                   onClick={() => setModalWorkoutIntensity(num)}
                   style={{
                     flex: 1,
-                    background: modalWorkoutIntensity === num ? '#10b981' : '#f2ede4',
-                    color: modalWorkoutIntensity === num ? 'white' : '#1c1917'
+                    background: modalWorkoutIntensity === num ? '#10b981' : 'var(--chip)',
+                    color: modalWorkoutIntensity === num ? 'white' : 'var(--dark)'
                   }}
                 >
                   {num} 🔥
@@ -4274,7 +4471,7 @@ export default function App() {
               placeholder="הערה / מרחק / משקל / זמן (אופציונלי)..." 
               value={modalWorkoutNotes} 
               onChange={e => setModalWorkoutNotes(e.target.value)}
-              style={{ background: 'white' }}
+              style={{ background: 'var(--card)' }}
             />
 
             <div style={{ display: 'flex', gap: '8px', marginTop: '14px' }}>
@@ -4292,12 +4489,12 @@ export default function App() {
         <div className="modal-overlay" onClick={() => setShowScoreInfoModal(false)}>
           <div className="modal-box" onClick={e => e.stopPropagation()}>
             <h3 style={{ marginBottom: '8px' }}>ℹ️ מה מסמלים הציון היומי והצבעים?</h3>
-            <p style={{ fontSize: '0.84rem', color: '#57534e', lineHeight: 1.5, marginBottom: '12px' }}>
+            <p style={{ fontSize: '0.84rem', color: 'var(--text-2)', lineHeight: 1.5, marginBottom: '12px' }}>
               ציון האיזון שלך (כרגע <strong>{computedBalanceScore} מתוך 10</strong>) הוא ממוצע של 4 קשתות הצבע בעיגול:
             </p>
             <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', marginBottom: '14px' }}>
               {PILLARS_INFO.map(p => (
-                <div key={p.name} style={{ background: '#ffffff', padding: '10px 12px', borderRadius: '14px', border: '1px solid #ede8df' }}>
+                <div key={p.name} style={{ background: 'var(--card)', padding: '10px 12px', borderRadius: '14px', border: '1px solid var(--border)' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontWeight: 800, fontSize: '0.88rem' }}>
                     <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
                       <span style={{ width: '14px', height: '14px', borderRadius: '50%', background: p.color, display: 'inline-block' }} />
@@ -4305,7 +4502,7 @@ export default function App() {
                     </span>
                     <span>{p.score}/10</span>
                   </div>
-                  <div style={{ fontSize: '0.78rem', color: '#78716c', marginTop: '4px' }}>{p.desc}</div>
+                  <div style={{ fontSize: '0.78rem', color: 'var(--muted)', marginTop: '4px' }}>{p.desc}</div>
                 </div>
               ))}
             </div>
@@ -4316,19 +4513,80 @@ export default function App() {
         </div>
       )}
 
-      {/* מודאל פרופיל משתמש */}
+      {/* מודאל פרופיל והגדרות */}
       {showUserModal && (
         <div className="modal-overlay" onClick={() => setShowUserModal(false)}>
           <div className="modal-box" onClick={e => e.stopPropagation()}>
-            <h3 style={{ marginBottom: '8px' }}>👤 חשבון משתמש מחובר</h3>
-            <div style={{ background: '#ffffff', padding: '14px', borderRadius: '18px', border: '1px solid #ede8df', marginBottom: '14px' }}>
-              <div><strong>שם תצוגה:</strong> {currentUser.displayName}</div>
-              <div><strong>שם משתמש בענן:</strong> <code>{currentUser.username}</code></div>
-              <div><strong>סטטוס סנכרון:</strong> {syncStatus}</div>
+            <div className="profile-header">
+              <div className="profile-avatar">{(currentUser.displayName || '?').trim().charAt(0)}</div>
+              <div>
+                <div style={{ fontWeight: 900, fontSize: '1.05rem' }}>{currentUser.displayName}</div>
+                <small style={{ color: 'var(--muted)' }}>@{currentUser.username} • {syncStatus}</small>
+                <div style={{ fontSize: '0.78rem', fontWeight: 700, marginTop: '2px' }}>{levelInfo.title} • ⭐ {globalData.lifetimePoints || globalData.points} נק׳ מצטברות</div>
+              </div>
             </div>
-            <div style={{ display: 'flex', gap: '8px' }}>
+
+            <div className="settings-section">
+              <div className="settings-title">🎨 מראה</div>
+              <div className="segmented-toggle three">
+                {[['light', '☀️ בהיר'], ['dark', '🌙 כהה'], ['auto', '📱 אוטומטי']].map(([key, label]) => (
+                  <button
+                    key={key}
+                    type="button"
+                    className={`segmented-btn ${themePref === key ? 'active-theme' : ''}`}
+                    onClick={() => { setThemePref(key); haptic('light'); }}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="settings-section">
+              <div className="settings-title">🎯 היעדים היומיים שלי</div>
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <label style={{ flex: 1 }}>
+                  <small style={{ fontWeight: 800 }}>💧 כוסות מים</small>
+                  <input
+                    type="number"
+                    min="1"
+                    max="30"
+                    value={globalData.waterTarget}
+                    onChange={e => setGlobalData(prev => ({ ...prev, waterTarget: Math.max(1, Math.min(30, Number(e.target.value) || 1)) }))}
+                  />
+                </label>
+                <label style={{ flex: 1 }}>
+                  <small style={{ fontWeight: 800 }}>👟 צעדים</small>
+                  <input
+                    type="number"
+                    min="1000"
+                    step="500"
+                    value={globalData.stepsTarget}
+                    onChange={e => setGlobalData(prev => ({ ...prev, stepsTarget: Math.max(500, Number(e.target.value) || 500) }))}
+                  />
+                </label>
+              </div>
+            </div>
+
+            <div className="settings-section">
+              <div className="settings-title">💾 גיבוי ושחזור</div>
+              <p style={{ fontSize: '0.78rem', color: 'var(--muted)', marginBottom: '8px', lineHeight: 1.5 }}>
+                הנתונים כבר מסונכרנים לענן, אבל כדאי לשמור גם קובץ גיבוי מדי פעם (ל-Drive או למחשב).
+              </p>
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <button style={{ flex: 1 }} onClick={handleExportBackup} disabled={backupBusy}>
+                  <Download size={16} /> {backupBusy ? 'יוצר...' : 'יצירת גיבוי'}
+                </button>
+                <label className="file-btn">
+                  ↩️ שחזור מקובץ
+                  <input type="file" accept="application/json,.json" onChange={handleImportBackup} hidden />
+                </label>
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', gap: '8px', marginTop: '14px' }}>
               <button onClick={handleLogout} style={{ flex: 1, background: '#e11d48', color: 'white' }}>
-                <LogOut size={16} /> התנתק / החלף משתמש
+                <LogOut size={16} /> התנתקות
               </button>
               <button className="icon-btn" onClick={() => setShowUserModal(false)}>סגור</button>
             </div>
@@ -4349,25 +4607,25 @@ export default function App() {
                 📅 אירוע ביומן
               </button>
               <button 
-                style={{ background: '#d1fae5', color: '#065f46', padding: '14px', borderRadius: '18px' }}
+                style={{ background: 'var(--green-soft)', color: 'var(--green-text)', padding: '14px', borderRadius: '18px' }}
                 onClick={() => { setShowQuickAddModal(false); setBudgetEntryMode('income'); setActiveTab('budget'); }}
               >
                 💰 הוספת הכנסה
               </button>
               <button 
-                style={{ background: '#ffe4e6', color: '#9f1239', padding: '14px', borderRadius: '18px' }}
+                style={{ background: 'var(--rose-soft)', color: 'var(--rose-text)', padding: '14px', borderRadius: '18px' }}
                 onClick={() => { setShowQuickAddModal(false); setBudgetEntryMode('expense'); setActiveTab('budget'); }}
               >
                 💸 רישום הוצאה
               </button>
               <button 
-                style={{ background: '#eae4f9', color: '#1c1917', padding: '14px', borderRadius: '18px' }}
+                style={{ background: 'var(--lavender-soft)', color: 'var(--dark)', padding: '14px', borderRadius: '18px' }}
                 onClick={() => { setShowQuickAddModal(false); setReflectionModal({ contextTitle: 'כתיבה מהירה ביומן הרגשות' }); }}
               >
                 💭 רגש / מחשבה
               </button>
               <button
-                style={{ background: '#fde8ec', color: '#881337', padding: '14px', borderRadius: '18px', gridColumn: '1 / -1' }}
+                style={{ background: 'var(--rose-soft)', color: 'var(--rose-text)', padding: '14px', borderRadius: '18px', gridColumn: '1 / -1' }}
                 onClick={() => { setShowQuickAddModal(false); openUrgeModal(); }}
               >
                 🫶 רגע קשה עם אוכל (SOS)
@@ -4385,7 +4643,7 @@ export default function App() {
         <div className="modal-overlay" onClick={() => setShowMiddayModal(false)}>
           <div className="modal-box" onClick={e => e.stopPropagation()}>
             <h3 style={{ marginBottom: '6px' }}>🌤️ עצירת אמצע היום</h3>
-            <p style={{ fontSize: '0.85rem', color: '#57534e', marginBottom: '10px' }}>
+            <p style={{ fontSize: '0.85rem', color: 'var(--text-2)', marginBottom: '10px' }}>
               קחי נשימה עמוקה ושתי כוס מים. איך את מרגישה ברגע זה של היום?
             </p>
             <div className="mood-selector">
@@ -4540,7 +4798,7 @@ export default function App() {
             {urgeStep === 'halt' && (
               <>
                 <h3 style={{ marginBottom: '6px' }}>🫶 עצירה רגע</h3>
-                <p style={{ fontSize: '0.85rem', color: '#57534e', marginBottom: '10px', lineHeight: 1.5 }}>
+                <p style={{ fontSize: '0.85rem', color: 'var(--text-2)', marginBottom: '10px', lineHeight: 1.5 }}>
                   עשית צעד חשוב רק בזה שפתחת את המסך הזה. בואי נבדוק מה קורה עכשיו – אפשר לבחור יותר מאחד:
                 </p>
                 <div className="halt-grid">
@@ -4564,7 +4822,7 @@ export default function App() {
                       key={n}
                       type="button"
                       onClick={() => setUrgeIntensity(n)}
-                      style={{ flex: 1, background: urgeIntensity === n ? '#e11d48' : '#f2ede4', color: urgeIntensity === n ? 'white' : '#1c1917' }}
+                      style={{ flex: 1, background: urgeIntensity === n ? '#e11d48' : 'var(--chip)', color: urgeIntensity === n ? 'white' : 'var(--dark)' }}
                     >
                       {n}
                     </button>
@@ -4581,7 +4839,7 @@ export default function App() {
                 )}
 
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginTop: '12px' }}>
-                  <button style={{ background: '#1c1917' }} onClick={startUrgeTimer}>
+                  <button style={{ background: 'var(--ink)' }} onClick={startUrgeTimer}>
                     🌊 גלישה על הדחף – טיימר {URGE_TIMER_MINUTES} דק׳ עם נשימות
                   </button>
                   {urgeHalt.includes('hungry') && (
@@ -4601,10 +4859,10 @@ export default function App() {
                 <div style={{ fontSize: '2.2rem', fontWeight: 900, letterSpacing: '1px', margin: '6px 0' }}>
                   {String(Math.floor(urgeSecondsLeft / 60)).padStart(2, '0')}:{String(urgeSecondsLeft % 60).padStart(2, '0')}
                 </div>
-                <p style={{ fontSize: '0.9rem', color: '#44403c', lineHeight: 1.55, minHeight: '56px', fontWeight: 600 }}>
+                <p style={{ fontSize: '0.9rem', color: 'var(--text-2)', lineHeight: 1.55, minHeight: '56px', fontWeight: 600 }}>
                   {urgeSurfPrompt}
                 </p>
-                <small style={{ color: '#78716c', display: 'block', margin: '6px 0 12px' }}>
+                <small style={{ color: 'var(--muted)', display: 'block', margin: '6px 0 12px' }}>
                   אפשר לסגור את המסך – תקבלי התראה כשהזמן ייגמר.
                 </small>
                 <div style={{ display: 'flex', gap: '8px' }}>
@@ -4617,7 +4875,7 @@ export default function App() {
             {urgeStep === 'outcome' && (
               <>
                 <h3 style={{ marginBottom: '6px' }}>איך זה הסתיים?</h3>
-                <p style={{ fontSize: '0.84rem', color: '#57534e', marginBottom: '10px' }}>
+                <p style={{ fontSize: '0.84rem', color: 'var(--text-2)', marginBottom: '10px' }}>
                   כל תשובה בסדר ומזכה באותן +{POINTS.URGE_CHECKIN} נק׳. כנות עם עצמך היא הכוח פה.
                 </p>
                 <textarea
