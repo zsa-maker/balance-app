@@ -44,11 +44,42 @@ jobs:
       - name: Copy web build into Android project
         run: npx cap sync android
 
-      - name: Build APK
+      # Maven Central לפעמים חוסם את שרתי GitHub (שגיאה 429). מורידים קודם מהמראה של Google,
+      # ושומרים את ההורדות ב-cache כדי שבנייה הבאה כמעט לא תצטרך להוריד כלום.
+      - name: Use Google's Maven Central mirror
+        run: |
+          mkdir -p ~/.gradle/init.d
+          cat > ~/.gradle/init.d/maven-mirror.gradle <<'GRADLE'
+          def mirrorUrl = 'https://maven-central.storage-download.googleapis.com/maven2/'
+          allprojects {
+              buildscript {
+                  repositories {
+                      maven { url mirrorUrl }
+                  }
+              }
+              repositories {
+                  maven { url mirrorUrl }
+              }
+          }
+          GRADLE
+
+      - name: Build APK (with automatic retries)
         working-directory: android
         run: |
           chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon
+          for attempt in 1 2 3; do
+            echo "::group::Gradle attempt $attempt"
+            if ./gradlew assembleDebug --no-daemon \
+                 -Dorg.gradle.internal.repository.max.retries=8 \
+                 -Dorg.gradle.internal.repository.initial.backoff=2000; then
+              echo "::endgroup::"
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "Attempt $attempt failed – waiting before retry..."
+            sleep $((attempt * 45))
+          done
+          exit 1
 
       - name: Rename APK
         run: cp android/app/build/outputs/apk/debug/app-debug.apk balance-app.apk
